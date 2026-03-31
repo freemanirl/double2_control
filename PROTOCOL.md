@@ -12,10 +12,11 @@ Reverse-engineered from six BTsnoop captures (`bt_captures/`) using a BLE-connec
 |-----------|-------|
 | Protocol | BLE L2CAP **Credit-Based CoC** (not GATT Write) |
 | Robot MAC address | `78:83:A0:A8:EC:66` |
+| BLE advertising name | "Double 10-0" (Microchip RN-series BT module — iAP firmware) |
 | Address type | Public (`0x00`) |
-| Local CID (host → robot) | Dynamically assigned (e.g. `0x0041`, `0x0049`) |
-| Remote CID (robot → host) | Dynamically assigned (e.g. `0x1407`, `0x0d07`) |
-| L2CAP PSM | **Not visible in captures** — connection setup preceded snoop recording.  Run `--discover-psm` or try `0x0025` first. |
+| L2CAP PSM | **`0x0003`** — confirmed from `connect.log` (Transparent UART / iAP CoC channel) |
+| Local CID (host → robot) | Dynamically assigned by device per session (e.g. `0x0041`, `0x0049`) |
+| Remote CID (robot → host) | Dynamically assigned by host per session (e.g. `0x1407`, `0x0d07`) |
 
 The host opens a SOCK_SEQPACKET L2CAP socket and connects to the robot's PSM.  Each `send()` call is one L2CAP CoC SDU.  Each command is a self-contained raw byte payload — there is no GATT characteristic involved.
 
@@ -218,5 +219,5 @@ The reply payloads have not been fully decoded but follow a similar counter-echo
 - `RobotPacketBuilder` in `robot_control.py` constructs all packet types; call `.movement(m1, m2)`, `.heartbeat()`, `.park()`, `.raise_arm()`, `.lower_arm()`, or the named helpers (`.forward()`, `.backward()`, etc.).
 - `RobotController` wraps a BlueZ L2CAP CoC socket and runs a background heartbeat thread automatically.
 - L2CAP CoC sockets require `CAP_NET_RAW`: run as root or `sudo setcap cap_net_raw+eip $(which python3)`.
-- The PSM was not captured; use `--discover-psm` to read it from GATT characteristics, or try `0x0025` as a starting point.
+- PSM is `0x0003` (confirmed from `connect.log`). Connect directly with `--psm 0x0003`, or use `--discover-psm` to read it from GATT if the device firmware has been updated.
 - `python3 robot_control.py --self-test` re-derives the exact captured bytes and confirms 0 errors across all 332 movement + park/raise packets.

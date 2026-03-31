@@ -46,7 +46,7 @@ Offset  Size  Content
 | `raise.log` | — | — | ≈ 100 | — | `0x0861 – 0x62A0` | 2 |
 | `lower.log` | — | — | ≈ 200 | — | `0x64A1 – 0xAEC5` | 2 |
 | `turn right 2.log` | — | 289 | 100 | 189 | `0xAEC7 – 0xBD0E` | 2 |
-| `connect.log` | — | — | — | — | — | 2 |
+| `connect.log` | — | — | — | — | — | 2 | Full BLE connection sequence: LE advertising (name "Double 10-0"), SDP ("RN-iAP" / "Wireless iAP" services), L2CAP CoC setup PSM `0x0003` → CID `0x0049` |
 
 ### Chronological order
 
@@ -65,7 +65,7 @@ select  →  raise  →  [gap]  →  lower  →  turn right 2
 0x0656–0860  0x0861–62A0  62A1–64A0   0x64A1–AEC5   0xAEC7–BD0E
 ```
 
-`connect.log` contains HCI-level connection setup frames (L2CAP CoC credit exchange) and does not contain application-level CoC payloads.
+`connect.log` covers the BLE connection setup for session 2.  It shows: (1) LE advertising with device name **"Double 10-0"**, (2) L2CAP SDP browse (PSM `0x0001`) revealing service names **"RN-iAP"** and **"Wireless iAP"** — identifying the BT stack as a **Microchip RN-series module** running iAP firmware, (3) L2CAP Connection Request to PSM **`0x0003`** (the RN module's Transparent UART / iAP CoC service), and (4) the robot responding with dstCID `0x0049`, confirming the session 2 command channel.  **The CoC PSM is fixed at `0x0003`; only the CID changes each session.**
 
 ---
 
@@ -171,7 +171,8 @@ The 7-byte ACK is the robot's acknowledgement that the previous packet was recei
 
 ## 6. Capture Quality Notes
 
-- All captures start **mid-session** — the BLE connection setup (advertising, `LE_Create_Connection`, `LE_Connection_Complete`, L2CAP CoC credit exchange) is not present.  The PSM cannot be read from these files.
+- `connect.log` covers the BLE connection handshake — it does contain the PSM (`0x0003`) and the session 2 CID assignment (`0x0049`), but no application-level CoC command payloads.
+- All other captures start **mid-session** — the BLE connection setup is not present.
 - Timestamps in the BTsnoop headers use a reference epoch of **1 January 2000** (not Unix epoch).  The raw timestamp values are very large numbers because the captures appear to have been taken years after 2000.
 - No packets were dropped — the `cumulative drops` field is `0` in all records.
 - The `CTRL→HOST` packet count is always higher than `HOST→CTRL` because the robot sends an ACK for (nearly) every host packet, plus unsolicited status frames.

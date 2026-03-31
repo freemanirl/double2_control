@@ -71,9 +71,10 @@ Checksum formulas verified across 396 movement packets + park/raise packets with
 Connection
 ==========
 The device uses BLE L2CAP Credit-Based CoC (not standard GATT writes).
-- The PSM is advertised over GATT (see discover_psm() below).
+- BLE advertising name: "Double 10-0" (Microchip RN-series BT module, iAP firmware).
+- PSM = 0x0003 (confirmed from connect.log; Transparent UART / iAP CoC channel).
 - Device address type is PUBLIC (0x00).
-- CIDs are dynamically assigned by the BlueZ L2CAP stack.
+- CIDs are dynamically assigned per session by the robot's BT stack.
 
 Dependencies
 ============
@@ -83,7 +84,7 @@ Usage
 =====
     python robot_control.py
     python robot_control.py --scan     # just scan and show nearby devices
-    python robot_control.py --address 78:83:A0:A8:EC:66 --psm 0x0025
+    python robot_control.py --address 78:83:A0:A8:EC:66 --psm 0x0003
 """
 
 import argparse
@@ -100,10 +101,11 @@ import time
 
 ROBOT_ADDRESS = "78:83:A0:A8:EC:66"
 
-# L2CAP CoC PSM.  The PSM is NOT visible in the provided captures because
-# the connection setup happened before snoop recording started.  Run
-# discover_psm() or use --scan to find it, or try 0x0025 first.
-DEFAULT_PSM = 0x0025
+# L2CAP CoC PSM.  Confirmed 0x0003 from connect.log (L2CAP Connection Request
+# observed connecting to PSM 0x0003 to establish the Transparent UART / iAP CoC
+# channel on this Microchip RN-series module).  The CoC CID is dynamically
+# assigned per session by the device; it is NOT the same value as the PSM.
+DEFAULT_PSM = 0x0003
 
 # Motor value constants
 MOTOR_NEUTRAL   = 0x7F  # stop / no movement
@@ -389,7 +391,7 @@ class RobotController:
     """High-level robot controller.
 
     Usage::
-        ctrl = RobotController(address="78:83:A0:A8:EC:66", psm=0x0025)
+        ctrl = RobotController(address="78:83:A0:A8:EC:66", psm=0x0003)
         ctrl.connect()
         ctrl.forward(duration=2.0)   # drive forward for 2 seconds
         ctrl.turn_left(duration=0.5)
