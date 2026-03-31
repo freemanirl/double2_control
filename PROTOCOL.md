@@ -109,9 +109,9 @@ The only structural difference from the movement packet header is the magic byte
 
 ---
 
-### 3.3 — Park / Unpark Toggle (44 bytes)
+### 3.3 — Park / Unpark / Raise / Lower Toggle (44 bytes)
 
-Sent **once** per button press.  The robot **toggles** between parked and unparked on each receipt — there is no separate "park" vs "unpark" opcode.
+Sent **once** per button press.  The robot **toggles** state on each receipt — the same 44-byte packet structure is used for park/unpark, raise-arm, and lower-arm; the robot determines the action from its current state.
 
 ```
 Offset  Len  Value / Formula
@@ -121,9 +121,11 @@ Offset  Len  Value / Formula
  8       1   counter_lo
  9       1   counter_hi
 10       1   0x03  (constant)
-11       1   cmp  = (0x46 − counter_lo − counter_hi) mod 256  (same as movement)
+11       1   cmp  = (0x3C − counter_lo − counter_hi) mod 256
             ── sub-frame 1 ──────────────────────────────────────────────
-12–18    7   00 02 00 00 01 00 01  (fixed preamble)
+12       1   0x00  (fixed)
+13       1   tok_c  (session token C)
+14–18    5   00 00 01 00 01  (fixed)
 19       1   0x07  (type indicator — differs from movement's 0x09)
 20–24    5   01 03 01 20 01
 25       1   a1  — robot odometry tick (low byte, slowly increments)
@@ -133,14 +135,14 @@ Offset  Len  Value / Formula
 28–29    2   00 00  (separator)
 30–30    1   0x01
 31–38    8   00 01 07 01 03 01 20 01  (fixed)
-39       1   a2  — reference tick (typically 0x8E)
+39       1   a2  = (a1 + 1) mod 256  (next tick value)
 40       1   0x01
-41       1   b2  = (a2 + 0x2A) mod 256  = typically 0xB8
-42       1   ck  = (0x9E − a1 − b1 − a2 − b2) mod 256
+41       1   b2  = (a2 + 0x2A) mod 256
+42       1   ck  = (0xA0 − tok_c − a1 − b1 − a2 − b2) mod 256
 43       1   tok_b  (session token B)
 ```
 
-The `(a, b)` pairs appear to represent a robot internal odometry / state counter.  `b` is always `a + 0x2A`.  The sub-frame 2 reference values (`a2=0x8E, b2=0xB8`) were constant across both park events in the capture.
+The `(a, b)` pairs represent a robot internal odometry / state counter.  `b` is always `a + 0x2A`.  The two sub-frames carry consecutive tick values (a2 = a1 + 1).  `tok_c` at byte 13 and in the checksum means the full formula is session-specific — exactly analogous to `ck2` in the movement packet.
 
 ---
 
@@ -203,14 +205,18 @@ The reply payloads have not been fully decoded but follow a similar counter-echo
 | `bt_captures/turn right.log` | 1 | Turn-right command session |
 | `bt_captures/park.log` | 1 | Park button pressed multiple times (park + unpark cycles) |
 | `bt_captures/turn right 2.log` | 2 | Turn-right after unpair/repair — used to confirm session-token findings |
+| `bt_captures/select.log` | 2 | Connection / menu interaction — only neutral movement packets |
+| `bt_captures/raise.log` | 2 | Arm-raise button pressed — 4× 44-byte toggle packets |
+| `bt_captures/lower.log` | 2 | Arm-lower sequence — heartbeats and tick frames only (no command packets) |
+| `bt_captures/connect.log` | 2 | HCI-level connection setup frames (L2CAP CoC credit exchange) |
 | `robot_control.py` | — | Python implementation of the full protocol |
 
 ---
 
 ## 7. Implementation Notes
 
-- `RobotPacketBuilder` in `robot_control.py` constructs all packet types; call `.movement(m1, m2)`, `.heartbeat()`, `.park()`, or the named helpers (`.forward()`, `.backward()`, etc.).
+- `RobotPacketBuilder` in `robot_control.py` constructs all packet types; call `.movement(m1, m2)`, `.heartbeat()`, `.park()`, `.raise_arm()`, `.lower_arm()`, or the named helpers (`.forward()`, `.backward()`, etc.).
 - `RobotController` wraps a BlueZ L2CAP CoC socket and runs a background heartbeat thread automatically.
 - L2CAP CoC sockets require `CAP_NET_RAW`: run as root or `sudo setcap cap_net_raw+eip $(which python3)`.
 - The PSM was not captured; use `--discover-psm` to read it from GATT characteristics, or try `0x0025` as a starting point.
-- `python3 robot_control.py --self-test` re-derives the exact captured bytes and confirms 0 errors across all 332 movement packets.
+- `python3 robot_control.py --self-test` re-derives the exact captured bytes and confirms 0 errors across all 332 movement + park/raise packets.

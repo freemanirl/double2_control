@@ -1,6 +1,6 @@
 # BTsnoop Capture Files — Notes
 
-Notes on the five BTsnoop log files in `bt_captures/`.  These were produced by recording BLE HCI traffic on the host while interacting with a robot via its companion app.
+Notes on the BTsnoop log files in `bt_captures/`.  Nine application-level captures were analysed (plus one HCI connection-level file).  They were produced by recording BLE HCI traffic on the host while interacting with a robot via its companion app.
 
 ---
 
@@ -42,7 +42,11 @@ Offset  Size  Content
 | `forward.log` | 16 972 B | 357 | 126 | 231 | `0x65DC – 0x733B` | 1 |
 | `backward.log` | 15 065 B | 313 | 110 | 203 | `0x733C – 0x828C` | 1 |
 | `park.log` | 31 068 B | 629 | 217 | 412 | `0x838C – 0xF7D9` | 1 |
+| `select.log` | — | — | ≈ 9 | — | `0x0656 – 0x0860` | 2 |
+| `raise.log` | — | — | ≈ 100 | — | `0x0861 – 0x62A0` | 2 |
+| `lower.log` | — | — | ≈ 200 | — | `0x64A1 – 0xAEC5` | 2 |
 | `turn right 2.log` | — | 289 | 100 | 189 | `0xAEC7 – 0xBD0E` | 2 |
+| `connect.log` | — | — | — | — | — | 2 |
 
 ### Chronological order
 
@@ -54,7 +58,14 @@ turn right  →  turn left  →  forward  →  backward  →  park
              (continuous)  (gap ≈ 27)   (continuous)  (gap ≈ 255)
 ```
 
-`turn right 2.log` is from a **separate session** (after unpairing and re-pairing).  Its counter `0xAEC7–0xBD0E` overlaps in value with session 1 ranges and cannot be placed in the same sequence.  The session-specific tokens (see below) confirm it is a distinct connection.
+The **session 2** captures are also in counter sequence, confirming they were recorded in one session after unpairing/re-pairing:
+
+```
+select  →  raise  →  [gap]  →  lower  →  turn right 2
+0x0656–0860  0x0861–62A0  62A1–64A0   0x64A1–AEC5   0xAEC7–BD0E
+```
+
+`connect.log` contains HCI-level connection setup frames (L2CAP CoC credit exchange) and does not contain application-level CoC payloads.
 
 ---
 
@@ -62,16 +73,16 @@ turn right  →  turn left  →  forward  →  backward  →  park
 
 Sizes of **L2CAP CoC** payloads sent from host to robot (CID `0x0041` in session 1, `0x0049` in session 2):
 
-| Payload size | fwd | bwd | left | right | park | right2 | Meaning |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|--------|
-| **5 B** | 11 | 9 | 12 | 8 | 20 | 9 | Unknown short command (see §4) |
-| **13 B** | 14 | 15 | 8 | 6 | 113 | 16 | Heartbeat / keep-alive |
-| **28 B** | — | — | — | — | 5 | 1 | Extended status report |
-| **30 B** | 8 | 10 | 4 | 3 | 66 | 8 | Tick status / sensor frame |
-| **34 B** | 88 | 71 | 103 | 70 | 0* | 64 | Movement command |
-| **39 B** | — | — | 1 | — | 4 | — | Merged heartbeat + 30-byte frame |
-| **44 B** | — | — | — | — | 2 | — | Park / Unpark toggle |
-| **48 B** | — | — | 1 | — | — | — | Merged 34-byte + 30-byte frame |
+| Payload size | fwd | bwd | left | right | park | right2 | raise | lower | select | Meaning |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|--------|
+| **5 B** | 11 | 9 | 12 | 8 | 20 | 9 | — | — | — | Unknown short command (see §4) |
+| **13 B** | 14 | 15 | 8 | 6 | 113 | 16 | ≈ 80 | ≈ 150 | ≈ 4 | Heartbeat / keep-alive |
+| **28 B** | — | — | — | — | 5 | 1 | — | — | — | Extended status report |
+| **30 B** | 8 | 10 | 4 | 3 | 66 | 8 | ≈ 10 | ≈ 40 | — | Tick status / sensor frame |
+| **34 B** | 88 | 71 | 103 | 70 | 0* | 64 | 0 | 0 | 9 | Movement command |
+| **39 B** | — | — | 1 | — | 4 | — | — | — | — | Merged heartbeat + 30-byte frame |
+| **44 B** | — | — | — | — | 2 | — | 4 | 0 | — | Park / raise / lower toggle |
+| **48 B** | — | — | 1 | — | — | — | — | — | — | Merged 34-byte + 30-byte frame |
 
 \* `park.log` contains **no** 34-byte movement packets — the park button does not drive the motors.
 
@@ -127,9 +138,20 @@ The magic bytes (`ef 31 ff 5a 00 18 40`) and the `0x06` type byte distinguish it
 
 Sent roughly every 10–20 movement packets.  The `(a, b)` values slowly increment over the session — they appear to be an odometry or encoder tick counter internal to the robot, with `b = a + 0x2A` (same as the park packet).  The `0x07` type byte matches the park sub-frame type.
 
-### 4.5 — 39-byte and 48-byte merged frames
+### 4.5 — 39-byte merged frame (ef 47)
 
-Occasionally a heartbeat and a 30-byte or 34-byte frame are merged into a single L2CAP SDU.  The payloads are simply concatenated — the second payload begins immediately after the first `0x40` terminator.  This is a transport-level optimisation by the host stack, not a new command type.
+The 39-byte frame is a **protocol-level merge**, not a simple L2CAP concatenation.  Its structure:
+
+```
+Bytes  0–11  (12 B): heartbeat header with magic ef 47 (instead of ef 13), WITHOUT tok_b
+                    i.e. tok_a ef 47 ff 5a 00 09 40 lo hi 00 cmp
+Bytes 12–38  (27 B): 30-byte tick frame body, WITHOUT its first 3 bytes (tok_a ef 35)
+                    i.e. ff 5a 00 1a 40 lo hi 03 cmp ... ck tok_b
+```
+
+The complement constant for the ef 47 header is `0x5E` (same as a normal heartbeat).  The complement constant for the embedded tick portion is `0x4A` (same as a standalone 30-byte tick).  Both portions share a common counter value.
+
+This appears to be a host-side optimisation that merges a due heartbeat with a due tick update, using a distinct magic byte (`0x47`) for the combined packet.
 
 ---
 
@@ -203,4 +225,4 @@ def l2cap_coc_payload(hci_acl_bytes):
     return cid, payload
 ```
 
-The robot's command channel is **CID `0x0041`** (host → robot).
+The robot's command channel is **CID `0x0041`** (host → robot) in session 1, **`0x0049`** in session 2.

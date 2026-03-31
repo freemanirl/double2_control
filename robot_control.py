@@ -57,16 +57,16 @@ B) 13-byte HEARTBEAT / keep-alive  (sent periodically regardless of movement,
    Byte  11   : cmp  = (0x5e - ctr_lo - ctr_hi) mod 256
    Byte  12   : tok_b
 
-C) 44-byte PARK / UNPARK command  (sent once to toggle park mode)
-   Contains two concatenated "sub-frames" each carrying a sensor value pair
-   (a, b) where b = a + 0x2a always, and a slowly increments over the robot's
-   lifetime (it represents an internal tick/odometry counter).
-   Checksum at byte 42: ck = (0x9e - a1 - b1 - a2 - b2) mod 256
-   The park and unpark commands are structurally identical; the toggle is
-   determined by the robot's current state, not by a distinct command byte.
-   The reference (a, b) values in sub2 are typically 0x8e / 0xb8.
+C) 44-byte PARK / UNPARK / RAISE / LOWER toggle command
+   Sent once per button press to toggle the robot between states.
+   Magic: ef 51 ff 5a 00 28 40  (complement constant: 0x3c, NOT 0x46)
+   Two sub-frames each carry a (a, b) tick pair where b = (a + 0x2a) mod 256.
+   Checksum: ck = (0xa0 - tok_c - a1 - b1 - a2 - b2) mod 256
+   a1/a2 slowly increment over the robot's lifetime (odometry/position counter).
+   All of: park/unpark, raise-arm, lower-arm use this identical packet structure;
+   the robot toggles state on each receipt.
 
-Checksum formulas verified across 396 movement packets (two sessions) with 0 errors.
+Checksum formulas verified across 396 movement packets + park/raise packets with 0 errors.
 
 Connection
 ==========
@@ -160,13 +160,18 @@ class RobotPacketBuilder:
 
     @staticmethod
     def _move_cmp(lo: int, hi: int) -> int:
-        """Complement byte for 34-byte movement packets."""
+        """Complement byte for 34-byte movement and 30-byte tick packets (constant 0x46)."""
         return (0x46 - lo - hi) & 0xFF
 
     @staticmethod
     def _hb_cmp(lo: int, hi: int) -> int:
-        """Complement byte for 13-byte heartbeat packets."""
+        """Complement byte for 13-byte heartbeat packets (constant 0x5e)."""
         return (0x5E - lo - hi) & 0xFF
+
+    @staticmethod
+    def _park_cmp(lo: int, hi: int) -> int:
+        """Complement byte for 44-byte park/raise/lower toggle packets (constant 0x3c)."""
+        return (0x3C - lo - hi) & 0xFF
 
     @staticmethod
     def _ck1(m1: int, m2: int) -> int:
@@ -174,6 +179,10 @@ class RobotPacketBuilder:
 
     def _ck2(self, m1: int, m2: int) -> int:
         return (0xDA - 2 * (m1 + m2) - self._tok_c) & 0xFF
+
+    def _park_ck(self, a1: int, b1: int, a2: int, b2: int) -> int:
+        """Checksum for 44-byte park/raise/lower toggle packets."""
+        return (0xA0 - self._tok_c - a1 - b1 - a2 - b2) & 0xFF
 
     # ── public packet constructors ───────────────────────────────────────────
 
@@ -231,31 +240,30 @@ class RobotPacketBuilder:
         return self.movement(MOTOR_NEUTRAL, speed)
 
     def park(self) -> bytes:
-        """44-byte park/unpark toggle command.
+        """44-byte park/unpark/raise/lower toggle command.
 
-        Sends two sub-frames each referencing a (tick_a, tick_b) pair.
-        Sub1 uses the current tick; sub2 uses the fixed reference values
-        (0x8e / 0xb8) that were common across both park events in the capture.
-        The robot toggles between parked and unparked on each call.
+        Sends two sub-frames each carrying a (a, b) tick pair where
+        b = (a + 0x2a) mod 256.  Sub-frame 2 uses the next tick value
+        (a2 = a1 + 1).  The robot toggles state on each receipt.
         """
         lo, hi = self._next_counter()
-        cmp = self._move_cmp(lo, hi)  # uses movement complement formula
+        cmp = self._park_cmp(lo, hi)
 
-        # Sub-frame 1: current robot tick value
+        # Sub-frame 1: current tick
         a1 = self._tick_a
         b1 = (a1 + 0x2A) & 0xFF
 
-        # Sub-frame 2: fixed reference seen consistently in captures
-        a2 = PARK_REF_A
-        b2 = PARK_REF_B
+        # Sub-frame 2: next tick (a2 = a1 + 1)
+        a2 = (a1 + 1) & 0xFF
+        b2 = (a2 + 0x2A) & 0xFF
 
-        ck = (0x9E - a1 - b1 - a2 - b2) & 0xFF
+        ck = self._park_ck(a1, b1, a2, b2)
 
         pkt = bytes([
             self._tok_a, 0xEF, 0x51, 0xFF, 0x5A, 0x00, 0x28, 0x40,
             lo, hi, 0x03, cmp,
             # sub-frame 1 body
-            0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0x00, self._tok_c, 0x00, 0x00, 0x01, 0x00, 0x01,
             0x07, 0x01, 0x03, 0x01, 0x20, 0x01, a1, 0x01, b1,
             # separator
             0x00, 0x00,
@@ -267,6 +275,14 @@ class RobotPacketBuilder:
         # Advance tick for next park call
         self._tick_a = (self._tick_a + 1) & 0xFF
         return pkt
+
+    def raise_arm(self) -> bytes:
+        """Raise arm toggle command (identical 44-byte packet to park())."""
+        return self.park()
+
+    def lower_arm(self) -> bytes:
+        """Lower arm toggle command (identical 44-byte packet to park())."""
+        return self.park()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -516,6 +532,22 @@ class RobotController:
         self._send(self._builder.park())
         print("Park command sent (toggles park state each call).")
 
+    def raise_arm(self) -> None:
+        """Send the arm-raise toggle command.
+
+        The same 44-byte toggle packet as park().  Call once to start raising;
+        call again (or call lower_arm()) to stop / lower.
+        """
+        self._send(self._builder.raise_arm())
+
+    def lower_arm(self) -> None:
+        """Send the arm-lower toggle command.
+
+        Identical to raise_arm() at the packet level — the robot state
+        determines whether this raises or lowers the arm.
+        """
+        self._send(self._builder.lower_arm())
+
     def custom_move(self, m1: int, m2: int,
                     duration: float = 0.0) -> None:
         """Send a custom movement with explicit motor values.
@@ -571,6 +603,14 @@ def verify_packets() -> None:
           bh1.heartbeat(),
           bytes.fromhex("09ef13ff5a0009408c83004f40"))
 
+    # park toggle @ counter 0xb0ab, tick=0x8d  (first park in park.log)
+    bp1 = RobotPacketBuilder(initial_counter=0xB0AB, tok_a=0x09, tok_b=0x40, tok_c=0x02)
+    bp1._tick_a = 0x8D
+    check("S1 park     @ 0xb0ab",
+          bp1.park(),
+          bytes.fromhex("09ef51ff5a0028 40abb003e1000200000100010701030120018d01b7"
+                        "0000010001070103012001 8e01b81440".replace(" ", "")))
+
     # ── Session 2 (tok_a=0x13, tok_b=0x65, tok_c=0x03) ───────────────────
     # turn right @ counter 0xaec7  (first movement packet in turn right 2.log)
     b2 = RobotPacketBuilder(initial_counter=0xAEC7,
@@ -592,6 +632,23 @@ def verify_packets() -> None:
     check("S2 heartbeat @ 0xafc7",
           bh2.heartbeat(),
           bytes.fromhex("13ef13ff5a0009 40c7af00e865".replace(" ", "")))
+
+    # raise/park toggle @ counter 0x176b, tick=0x97  (first raise in raise.log)
+    br2 = RobotPacketBuilder(initial_counter=0x176B,
+                             tok_a=0x13, tok_b=0x65, tok_c=0x03)
+    br2._tick_a = 0x97
+    check("S2 raise    @ 0x176b",
+          br2.raise_arm(),
+          bytes.fromhex("13ef51ff5a002840 6b1703ba000300000100010701030120019701c1"
+                        "0000010001070103012001 9801c2eb65".replace(" ", "")))
+
+    # second raise @ counter 0x2879, tick=0xac  (second raise in raise.log)
+    br2._counter = 0x2879
+    br2._tick_a = 0xAC
+    check("S2 raise    @ 0x2879",
+          br2.raise_arm(),
+          bytes.fromhex("13ef51ff5a00284079280 39b000300000100010701030120 01ac01d6"
+                        "0000010001070103012001 ad01d79765".replace(" ", "")))
 
     # ── Checksum table ────────────────────────────────────────────────────
     bt = RobotPacketBuilder()
