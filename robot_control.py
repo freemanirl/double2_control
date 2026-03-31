@@ -87,6 +87,15 @@ IMPORTANT — iAP2 MFi authentication requirement:
   live commands you must first complete the iAP2 setup (or replay the exact byte
   sequence from connect.log) before calling any movement/park methods.
 
+  iap2_handshake() in this module implements a *replay* approach: it sends the
+  exact host-side bytes observed in connect.log (with tok_a/tok_c patched to the
+  live values) and reads+discards the robot's responses.  The auth challenge nonce
+  is replayed verbatim from the capture, so the robot may or may not enforce nonce
+  uniqueness.  If the robot rejects the stale challenge the full iAP2 crypto
+  (RSA/ECDSA certificate verification) would be required — that in turn requires
+  the Apple MFi root CA certificate, which is only available under Apple's MFi
+  developer license.
+
 Dependencies
 ============
     pip install bleak
@@ -344,6 +353,162 @@ def connect_coc(address: str, psm: int,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# iAP2 session handshake (replay from connect.log)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def iap2_handshake(sock: socket.socket,
+                   tok_a: int = 0x13,
+                   tok_c: int = 0x03,
+                   tok_b: int = 0x65,
+                   verbose: bool = False) -> tuple[int, int, int]:
+    """Perform the iAP2 session setup handshake over an already-connected CoC socket.
+
+    Replays the exact host-side byte sequence observed in bt_captures/connect.log
+    with tok_a, tok_c and tok_b patched to the current session values.  After the
+    handshake the robot sends its first 44-byte ef-51 toggle and the first heartbeat;
+    this function reads and discards all robot frames until a 13-byte heartbeat is
+    seen, then returns the negotiated session tokens.
+
+    The replay sends the auth-challenge nonce from the original capture verbatim.
+    Whether the robot enforces nonce uniqueness is unknown — if it does, the full
+    iAP2 crypto path (RSA/ECDSA + Apple MFi CA cert) would be required.
+
+    Args:
+        sock:    Connected SOCK_SEQPACKET L2CAP CoC socket.
+        tok_a:   Host session token A (byte 0 of host packets).  Default = session 2.
+        tok_c:   Session token C (pairing counter).  Default = session 2.
+        tok_b:   Token B (last byte of host packets).  Default = session 2.
+        verbose: Print each sent/received packet if True.
+
+    Returns:
+        (tok_a, tok_b, tok_c) — the tokens to pass to RobotPacketBuilder.
+
+    Sequence (from connect.log, records 255–345):
+        Phase 1 — token negotiation (fully static after patching)
+        Phase 2 — feature negotiation (ef09 frames, static)
+        Phase 3 — certificate auth (ef21 challenge, ef2b robot response — replayed)
+        Phase 4 — ef0d, first 30B tick, app info (ef21 types)
+        Phase 5 — robot sends ef51 + heartbeat → control protocol begins
+    """
+
+    def _send(label: str, pkt: bytes) -> None:
+        if verbose:
+            print(f"  TX {label:20s} ({len(pkt):3d}B)  {pkt[:16].hex(' ')}")
+        sock.send(pkt)
+
+    def _recv_until(stop_len: int, max_packets: int = 30) -> bytes | None:
+        """Drain packets until one of length stop_len is received."""
+        for _ in range(max_packets):
+            try:
+                sock.settimeout(3.0)
+                pkt = sock.recv(512)
+            except TimeoutError:
+                return None
+            if verbose:
+                print(f"  RX                      ({len(pkt):3d}B)  {pkt[:16].hex(' ')}")
+            if len(pkt) == stop_len:
+                return pkt
+        return None
+
+    # ── Phase 1: token negotiation ──────────────────────────────────────────
+    # Record [255]: 4B pre-session init (tok_a_pre=0x03 in capture; may be static)
+    _send("init-4B-pre",   bytes([0x03, 0x3f, 0x01, 0x1c]))
+    _recv_until(4)  # robot echoes 03 73 01 d7
+
+    # Record [259]: 14B ef-15 session negotiation
+    # byte[0]=0x03 (pre-session tok_a), byte[4]=robot_tok_a=0x11, byte[10]=tok_c
+    p = bytearray(bytes.fromhex("03ef15831104f00000ef03000070"))
+    p[10] = tok_c
+    _send("ef15-negotiate", bytes(p))
+    _recv_until(14)  # robot ef-15 reply
+
+    # Record [262]: 4B host tok_a assignment
+    # checksum byte: (0x00 - tok_a - 0x3f - 0x01) & 0xFF
+    ck = (0x00 - tok_a - 0x3f - 0x01) & 0xFF
+    _send("init-4B-tok_a", bytes([tok_a, 0x3f, 0x01, ck]))
+    _recv_until(4)  # robot echo
+
+    # ── Phase 2: feature negotiation (ef09, fully static) ──────────────────
+    # Records [265], [267]
+    _send("ef09-feat-1",   bytes.fromhex("03ef09e305138d70"))
+    _recv_until(8)
+    _send("ef09-feat-2",   bytes.fromhex("03ef09e105130d70"))
+    _recv_until(8)
+
+    # Record [271]: 5B mystery command (type 0x0f form, before cert exchange)
+    # last byte 0x79 is session-specific — replay from capture for now
+    _send("ff-cmd-0f",     bytes([tok_a, 0xff, 0x01, 0x0f, 0x79]))
+    _recv_until(5)
+
+    # ── Phase 3: certificate auth (replayed from capture) ──────────────────
+    # Robot sends 6 × 131B ef-ff cert fragments — drain them all
+    # then host sends ef21 type=0x09 challenge nonce (replayed verbatim):
+    # Record [301]: 20B ef21 type=0x09 — auth challenge (nonce at bytes 16–18)
+    p = bytearray(bytes.fromhex("13ef21ff5a0010404d00010940400006aa00d065"))
+    p[0]  = tok_a
+    p[19] = tok_b
+    # Drain robot cert chain (expect ~6×131B + 1×14B)
+    for _ in range(10):
+        try:
+            sock.settimeout(3.0)
+            raw = sock.recv(512)
+            if verbose:
+                print(f"  RX (cert drain)         ({len(raw):3d}B)  {raw[:8].hex(' ')}")
+            # 14B robot ack of first 30B tick is also in this window
+            if len(raw) == 14 and raw[2] == 0x13:
+                break
+        except TimeoutError:
+            break
+    # Drain 30B tick sent by robot before cert auth (record [297])
+    # then send ef21 challenge
+    _send("ef21-challenge", bytes(p))
+
+    # Drain robot's ef2b (25B signed response) and any intervening packets
+    _recv_until(25)
+
+    # ── Phase 4: auth result + app identity ────────────────────────────────
+    # Record [329]: ef21 type=0x05 (auth result / accept)
+    p = bytearray(bytes.fromhex("13ef21ff5a0010404f02010540400006aa05cb65"))
+    p[0]  = tok_a
+    p[19] = tok_b
+    _send("ef21-auth-ok",  bytes(p))
+
+    # Record [333]: ef21 type=0x04
+    p = bytearray(bytes.fromhex("13ef21ff5a00104050020104404000061d005d65"))
+    p[0]  = tok_a
+    p[19] = tok_b
+    _send("ef21-type04",   bytes(p))
+
+    # Record [295]: 10B ef0d
+    p = bytearray(bytes.fromhex("13ef0dff550200ee1065"))
+    p[0]  = tok_a
+    p[9]  = tok_b
+    _send("ef0d",          bytes(p))
+
+    # Record [298]: 30B first tick frame (counter 0x004c at bytes 8-9)
+    p = bytearray(bytes.fromhex("13ef35ff5a001ac04c000081017fffff05dc000a1e010100010302017065"))
+    p[0]  = tok_a
+    p[13] = tok_c
+    p[29] = tok_b
+    _send("30B-tick",      bytes(p))
+
+    # Record [315]: 5B mystery command (type 0x0a form — triggers robot ready)
+    _send("ff-cmd-0a",     bytes([tok_a, 0xff, 0x01, 0x0a, 0x79]))
+
+    # Record [339]: ef21 type=0x02 (final app identity)
+    p = bytearray(bytes.fromhex("13ef21ff5a00104051030102404000061d025b65"))
+    p[0]  = tok_a
+    p[19] = tok_b
+    _send("ef21-type02",   bytes(p))
+
+    # ── Phase 5: wait for robot's ef51 + first heartbeat ───────────────────
+    # Robot sends a 44B ef51 at startup, then a 13B heartbeat
+    _recv_until(13, max_packets=20)
+
+    return tok_a, tok_b, tok_c
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PSM discovery via GATT
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -421,11 +586,17 @@ class RobotController:
     COMMAND_REPEAT_INTERVAL = 0.05  # seconds between repeated movement frames
 
     def __init__(self, address: str = ROBOT_ADDRESS, psm: int = DEFAULT_PSM,
-                 addr_type: int = _BDADDR_LE_PUBLIC):
-        self.address   = address
-        self.psm       = psm
-        self.addr_type = addr_type
-        self._builder  = RobotPacketBuilder()
+                 addr_type: int = _BDADDR_LE_PUBLIC,
+                 tok_a: int = 0x13, tok_b: int = 0x65, tok_c: int = 0x03,
+                 do_handshake: bool = True):
+        self.address      = address
+        self.psm          = psm
+        self.addr_type    = addr_type
+        self._tok_a       = tok_a
+        self._tok_b       = tok_b
+        self._tok_c       = tok_c
+        self._do_handshake = do_handshake
+        self._builder  = RobotPacketBuilder(tok_a=tok_a, tok_b=tok_b, tok_c=tok_c)
         self._sock: socket.socket | None = None
         self._hb_thread: threading.Thread | None = None
         self._hb_stop   = threading.Event()
@@ -433,10 +604,22 @@ class RobotController:
     # ── connection lifecycle ─────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Connect to the robot and start the heartbeat thread."""
+        """Connect to the robot and start the heartbeat thread.
+
+        If do_handshake=True (the default) the iAP2 session setup sequence is
+        run automatically after the L2CAP CoC channel is established.  Set
+        do_handshake=False only if you have already completed the handshake
+        externally or are replaying a captured session.
+        """
         print(f"Connecting to {self.address}  PSM=0x{self.psm:04x} …")
         self._sock = connect_coc(self.address, self.psm, self.addr_type)
-        print("Connected.")
+        print("L2CAP CoC connected.")
+        if self._do_handshake:
+            print("Running iAP2 handshake …")
+            iap2_handshake(self._sock,
+                           tok_a=self._tok_a, tok_b=self._tok_b, tok_c=self._tok_c,
+                           verbose=True)
+            print("iAP2 handshake complete.")
         self._hb_stop.clear()
         self._hb_thread = threading.Thread(
             target=self._heartbeat_loop, daemon=True)
