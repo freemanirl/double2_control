@@ -15,12 +15,16 @@ Session tokens
 Three bytes change each time the device is paired / a new BLE session starts
 and remain constant for the lifetime of that session:
 
-  tok_a  : byte  0 of every packet          (session 1 = 0x09, session 2 = 0x13)
-  tok_b  : last byte of 13/30/34-byte pkts  (session 1 = 0x40, session 2 = 0x65)
-  tok_c  : byte 13 of 34-byte movement pkts (session 1 = 0x02, session 2 = 0x03)
+  tok_a  : byte  0 of every HOST→ROBOT packet  (session 1 = 0x09, session 2 = 0x13)
+  tok_b  : last byte of 13/30/34-byte host pkts (session 1 = 0x40, session 2 = 0x65)
+  tok_c  : byte 13 of 34-byte movement pkts     (session 1 = 0x02, session 2 = 0x03)
 
-tok_c also feeds into ck2.  The L2CAP CoC CIDs are similarly session-specific
-(dynamically assigned by the host stack).
+The robot also has its own tok_a used in ROBOT→HOST data packets (0x11 in session 2).
+This code only generates host→robot packets so only the host tok_a values matter here.
+
+All tokens are negotiated during the iAP2 session setup phase (see connect.log): tok_a
+and tok_c are exchanged in the 14-byte `ef 15` negotiation frame; the host assigns its
+own tok_a immediately after via a short 4-byte init packet.
 
 Packet types found in captures
 -------------------------------
@@ -76,6 +80,13 @@ The device uses BLE L2CAP Credit-Based CoC (not standard GATT writes).
 - Device address type is PUBLIC (0x00).
 - CIDs are dynamically assigned per session by the robot's BT stack.
 
+IMPORTANT — iAP2 MFi authentication requirement:
+  After establishing the L2CAP CoC channel the robot runs the full iAP2 handshake
+  (Apple MFi certificate exchange + feature negotiation) before it will respond to
+  any robot-control packets.  This code does NOT implement that handshake — to send
+  live commands you must first complete the iAP2 setup (or replay the exact byte
+  sequence from connect.log) before calling any movement/park methods.
+
 Dependencies
 ============
     pip install bleak
@@ -130,14 +141,16 @@ class RobotPacketBuilder:
     The 16-bit counter increments with every packet sent (heartbeat and
     movement share the same counter).
 
-    tok_a, tok_b, tok_c are session-specific bytes that change each time
-    the device is paired / a new BLE session is established.  Use the
-    default values (from session 1 of the captures) unless you have
-    observed the tokens for the current session.
+    tok_a, tok_b, tok_c are the HOST's session-specific tokens that change
+    each time the device is paired / a new BLE session is established.  The
+    robot has its own distinct tok_a (seen in ROBOT→HOST packets) but that
+    value is not used here — only the host-side tokens affect the packets this
+    class builds.  Use the default values (from session 1 of the captures)
+    unless you have observed the tokens for the current session.
 
-    Session token defaults (session 1):
-        tok_a = 0x09  (first byte of every packet)
-        tok_b = 0x40  (last byte of 13/30/34-byte packets)
+    Session token defaults (session 1, host-side):
+        tok_a = 0x09  (first byte of every host packet)
+        tok_b = 0x40  (last byte of 13/30/34-byte host packets)
         tok_c = 0x02  (byte 13 of movement packets; also feeds into ck2)
     """
 

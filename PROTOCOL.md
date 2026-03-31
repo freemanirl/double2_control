@@ -153,13 +153,26 @@ Three bytes in every packet change when the device is unpaired and re-paired, an
 
 | Token | Location | Session 1 | Session 2 | Notes |
 |-------|----------|-----------|-----------|-------|
-| `tok_a` | byte 0 of every packet | `0x09` | `0x13` | First byte of every packet |
-| `tok_b` | last byte of every packet (except 5-byte) | `0x40` | `0x65` | Terminator position |
-| `tok_c` | byte 13 of movement (34B) packets | `0x02` | `0x03` | Also incorporated into `ck2` |
+| `tok_a` | byte 0 of every host packet | `0x09` | `0x13` | Assigned during iAP2 session setup; the **robot also has its own tok_a** (`0x11` in session 2) used in robot-originated data packets |
+| `tok_b` | last byte of every host packet (except 5-byte) | `0x40` | `0x65` | Terminator position |
+| `tok_c` | byte 13 of movement (34B) and park (44B) packets | `0x02` | `0x03` | Session counter; also feeds into `ck2` / park checksum |
 
-The 5-byte mystery packet (`09/13 ff 01 0a XX`) also has `tok_a` at byte 0 and a session-specific last byte, but the last byte value differs from `tok_b` and has not been independently derived.
+#### Token origin (from `connect.log`)
 
-These tokens are set during connection negotiation (specifically, during L2CAP CoC credit exchange or a subsequent handshake that precedes all logged captures).  Without captures of the connection setup they cannot be derived from first principles, but in practice they must be read from the connection or brute-forced.  `tok_c` appears to increment by 1 per pairing (0x02 → 0x03), suggesting it is a small persistent session counter stored on the phone.
+All three tokens are negotiated during the **iAP2 session setup phase** that runs over the same L2CAP CoC channel before the robot-control protocol begins.  The key exchange is a pair of 14-byte `ef 15` frames:
+
+```
+Host → Robot: [tok_a_pre] ef 15 83 [robot_tok_a] 04 f0 00 00 ef [tok_c] 00 00 70
+Robot → Host: [pre]       ef 15 81 [robot_tok_a] 04 e0 00 00 7f 00 00 00 aa
+```
+
+- `tok_c` (byte 10 of the host frame = `0x03` for session 2) is a **persistent pairing counter** that increments by 1 each time the device is re-paired.
+- `tok_a` for the host and for the robot are set just before this in a 4-byte init exchange (`[tok_a] 3f 01 XX` from host, `[tok_a] 73 01 XX` from robot).
+- `tok_b` first appears as the last byte of the first `ef 13` heartbeat packet after setup completes.
+
+**Important:** the robot sends its own data packets (heartbeats, status frames, etc.) with its own tok_a as byte 0 (`0x11` in session 2), **not** the host's tok_a.  However, robot ACK packets copy the **host's** tok_a (`0x13`) as a session-echoing acknowledgement.
+
+The 5-byte mystery packet (`09/13 ff 01 0a XX`) has `tok_a` at byte 0. The last byte (e.g. `0x79` in session 2) is **not** tok_b and its derivation is unknown; it appears to be the robot's tok_a passed back via a separate token mechanism.
 
 ---
 
@@ -184,15 +197,16 @@ Heartbeat packets are sent periodically even between movement commands and share
 
 ## 5. Robot's Reply Packets
 
-The robot sends back on remote CID `0x1407` (captured as `CTRL→HOST` in the snoop files).  Three reply types were observed:
+The robot sends back on its assigned remote CID (`0x1407` in session 1, `0x0d07` in session 2).  The robot's byte 0 is its **own tok_a** (`0x11` in session 2), **not** the host's tok_a (`0x13`).  Exception: 7-byte ACK packets echo the host's tok_a.
 
 | Length | Identified purpose |
 |--------|-------------------|
-| 22 B | Periodic status / ACK (contains counter echo, likely sensor data) |
-| 7 B | Short ACK: `13 05 01 0d 00 01 00` |
-| 25–66 B | Larger status frames (sensor readings, orientation, etc.) |
+| 7 B | Short ACK: `[host_tok_a] 05 01 YY 00 ZZ 00`.  Sent after nearly every host packet; byte 0 mirrors the host's tok_a. |
+| 13 B | Robot heartbeat `ef 13` — same structure as host heartbeat but with robot's tok_a at byte 0 (`0x11`). |
+| 14 B | Chunked data header (robot → host `ff 13` format during session setup). |
+| 25–66 B | Larger sensor / state frames (`ef fd`, `ef ff` multi-chunk, etc.).  Not fully decoded; contain robot orientation/position data. |
 
-The reply payloads have not been fully decoded but follow a similar counter-echo structure.
+The 7-byte ACK echoing the host tok_a is how the robot acknowledges that a command was received and processed.
 
 ---
 
@@ -209,7 +223,7 @@ The reply payloads have not been fully decoded but follow a similar counter-echo
 | `bt_captures/select.log` | 2 | Connection / menu interaction — only neutral movement packets |
 | `bt_captures/raise.log` | 2 | Arm-raise button pressed — 4× 44-byte toggle packets |
 | `bt_captures/lower.log` | 2 | Arm-lower sequence — heartbeats and tick frames only (no command packets) |
-| `bt_captures/connect.log` | 2 | HCI-level connection setup frames (L2CAP CoC credit exchange) |
+| `bt_captures/connect.log` | 2 | Full connection capture: iAP2 MFi authentication (Apple certificate chain), token negotiation (`ef 15` frame establishes tok_a/tok_c), first CoC protocol packets |
 | `robot_control.py` | — | Python implementation of the full protocol |
 
 ---

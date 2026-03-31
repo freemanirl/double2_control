@@ -46,7 +46,7 @@ Offset  Size  Content
 | `raise.log` | — | — | ≈ 100 | — | `0x0861 – 0x62A0` | 2 |
 | `lower.log` | — | — | ≈ 200 | — | `0x64A1 – 0xAEC5` | 2 |
 | `turn right 2.log` | — | 289 | 100 | 189 | `0xAEC7 – 0xBD0E` | 2 |
-| `connect.log` | — | — | — | — | — | 2 | Full BLE connection sequence: LE advertising (name "Double 10-0"), SDP ("RN-iAP" / "Wireless iAP" services), L2CAP CoC setup PSM `0x0003` → CID `0x0049` |
+| `connect.log` | — | — | — | — | — | 2 | Full BLE pairing + app-open: LE advertising ("Double 10-0"), iAP2 MFi auth (Apple certificate chain via `ef ff` fragments), session token negotiation (`ef 15` frame), first CoC control packets (heartbeats, first `ef 51` park toggle from robot) |
 
 ### Chronological order
 
@@ -65,7 +65,21 @@ select  →  raise  →  [gap]  →  lower  →  turn right 2
 0x0656–0860  0x0861–62A0  62A1–64A0   0x64A1–AEC5   0xAEC7–BD0E
 ```
 
-`connect.log` covers the BLE connection setup for session 2.  It shows: (1) LE advertising with device name **"Double 10-0"**, (2) L2CAP SDP browse (PSM `0x0001`) revealing service names **"RN-iAP"** and **"Wireless iAP"** — identifying the BT stack as a **Microchip RN-series module** running iAP firmware, (3) L2CAP Connection Request to PSM **`0x0003`** (the RN module's Transparent UART / iAP CoC service), and (4) the robot responding with dstCID `0x0049`, confirming the session 2 command channel.  **The CoC PSM is fixed at `0x0003`; only the CID changes each session.**
+`connect.log` captures the **full session 2 pairing and app-open sequence**.  It records:
+
+1. LE advertising with device name **"Double 10-0"**.
+2. L2CAP SDP browse (PSM `0x0001`) revealing service names **"RN-iAP"** / **"Wireless iAP"** — the BT stack is a **Microchip RN-series module** and the high-level protocol is **Apple iAP2** (iPod Accessory Protocol v2).
+3. L2CAP Connection Request to PSM **`0x0003`** → dstCID `0x0049` (session 2 CoC channel).
+4. **iAP2 MFi authentication**: the robot sends six 131-byte `ef ff` payload fragments containing an X.509 certificate chain signed by **Apple Inc. / Apple Certification Authority**, proving it is a made-for-iPhone licensed accessory.  The host verifies the chain and computes a challenge response before the robot-control protocol starts.
+5. **Session token negotiation** — a pair of 14-byte `ef 15` frames establish the session parameters:
+   - Byte 4 = robot's own tok_a (`0x11` for session 2)
+   - Byte 10 = `tok_c` (`0x03` for session 2)
+   The host then assigns its own tok_a (`0x13`) via a short 4-byte `[tok_a] 3f 01 XX` exchange.
+6. Additional setup-only packet types: `ef 09` (8 B feature negotiation), `ef 21` (20 B session messages), `ef 0d` (10 B), `ef cb`, `ef 5d`, `ef 2b`.
+7. **Robot initiates with a 44-byte `ef 51` park/toggle** packet at app-open (the first ef-51 is robot → host, not host → robot).
+8. First heartbeat counter in connect.log: `0x014d`.  The first 30-byte tick frame counter is `0x004c`.
+
+**The CoC PSM is fixed at `0x0003`; only the CID changes each session.  All robot-control packets appear only after the iAP2 setup phase completes.**
 
 ---
 
@@ -94,9 +108,10 @@ A key finding from `turn right 2.log` (a second session after unpairing) is that
 
 | Token | Packet byte | Session 1 | Session 2 | Role |
 |-------|-------------|-----------|-----------|------|
-| `tok_a` | 0 (first byte) | `0x09` | `0x13` | Unknown; present in all packet types |
+| `tok_a` (host) | 0 (first byte of **host** packets) | `0x09` | `0x13` | Assigned during iAP2 ef-15 exchange; echoed by robot only in 7-byte ACKs |
+| `tok_a` (robot) | 0 (first byte of **robot** data packets) | `0x??` | `0x11` | Robot's own session token (from ef-15 byte 4); distinct from host's tok_a |
 | `tok_b` | last byte (13B/30B/34B packets) | `0x40` | `0x65` | Previously misidentified as a fixed terminator |
-| `tok_c` | byte 13 of 34B movement | `0x02` | `0x03` | Feeds into the `ck2` motor checksum |
+| `tok_c` | byte 13 of 34B movement | `0x02` | `0x03` | Feeds into the `ck2` motor checksum; also byte 10 of ef-15 frame |
 
 The L2CAP CoC CIDs also change per session (dynamically assigned):
 
@@ -107,7 +122,12 @@ The L2CAP CoC CIDs also change per session (dynamically assigned):
 
 The `ck2` formula must include `tok_c`: `ck2 = (0xDA − 2·(m1+m2) − tok_c) % 256`.  The original derivation `(0xD8 − 2·(m1+m2))` was only accidentally correct for session 1 where `tok_c = 0x02`.
 
-The origin of `tok_c`'s value (0x02, 0x03…) suggests it may be a persistent pairing counter stored in the companion app.  The origins of `tok_a` and `tok_b` are unknown without connection setup frames.
+The origin of each token has been established from `connect.log`:
+
+- **`tok_c`** (0x02, 0x03 …): a **persistent pairing counter**.  It is visible at byte 10 of the host's 14-byte `ef 15` session-init frame.  It increments by 1 each time the device is re-paired.
+- **`tok_a` (host)**: assigned by the host after the `ef 15` exchange in a 4-byte init packet `[tok_a] 3f 01 XX`.  The robot echoes it in a matching `[tok_a] 73 01 XX` reply and uses it only in 7-byte ACK packets.
+- **`tok_a` (robot)**: the robot also has its **own** tok_a (byte 4 of the `ef 15` frame; `0x11` in session 2) that it uses as byte 0 in all robot-originated data packets (heartbeats, status frames, `ef 51` initiations).  This is **distinct** from the host's tok_a.
+- **`tok_b`**: first appears as the last byte of the first `ef 13` heartbeat.  Its derivation from the session parameters is not yet known.
 
 ### 4.2 — 5-byte mystery command
 
@@ -171,7 +191,7 @@ The 7-byte ACK is the robot's acknowledgement that the previous packet was recei
 
 ## 6. Capture Quality Notes
 
-- `connect.log` covers the BLE connection handshake — it does contain the PSM (`0x0003`) and the session 2 CID assignment (`0x0049`), but no application-level CoC command payloads.
+- `connect.log` captures the complete BLE pairing + app-open sequence, including the iAP2 MFi certificate exchange, session-token negotiation, and the first CoC protocol packets (heartbeats + robot-initiated `ef 51` pack toggle).  It is the most information-dense capture in this set.
 - All other captures start **mid-session** — the BLE connection setup is not present.
 - Timestamps in the BTsnoop headers use a reference epoch of **1 January 2000** (not Unix epoch).  The raw timestamp values are very large numbers because the captures appear to have been taken years after 2000.
 - No packets were dropped — the `cumulative drops` field is `0` in all records.
