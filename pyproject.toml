@@ -1,0 +1,19 @@
+[project]
+name = "double2-control"
+version = "0.1.0"
+description = "BLE controller for the Double 2 robot (reverse-engineered iAP2 protocol)"
+authors = [
+    {name = "brandon"}
+]
+requires-python = "^3.13"
+dependencies = [
+    "bleak (>=0.22)"
+]
+
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

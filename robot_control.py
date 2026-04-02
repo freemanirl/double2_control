@@ -109,6 +109,11 @@ Usage
 
 import argparse
 import asyncio
+import ctypes
+import ctypes.util
+import errno
+import os
+import select
 import socket
 import struct
 import sys
@@ -119,7 +124,7 @@ import time
 # Known device parameters (from BTsnoop captures)
 # ──────────────────────────────────────────────────────────────────────────────
 
-ROBOT_ADDRESS = "78:83:A0:A8:EC:66"
+ROBOT_ADDRESS = "00:06:66:EC:A8:A0"  # discovered live unit; captures used 78:83:A0:A8:EC:66
 
 # L2CAP CoC PSM.  Confirmed 0x0003 from connect.log (L2CAP Connection Request
 # observed connecting to PSM 0x0003 to establish the Transparent UART / iAP CoC
@@ -317,6 +322,7 @@ class RobotPacketBuilder:
 _SOCKADDR_L2_FMT = "<HH6sHB"
 _AF_BLUETOOTH    = socket.AF_BLUETOOTH   # 31
 _BTPROTO_L2CAP   = socket.BTPROTO_L2CAP  # 0
+_BDADDR_BREDR      = 0  # classic BR/EDR
 _BDADDR_LE_PUBLIC  = 1
 _BDADDR_LE_RANDOM  = 2
 
@@ -326,29 +332,78 @@ def _parse_addr(addr_str: str) -> bytes:
     return bytes.fromhex(addr_str.replace(":", ""))[::-1]
 
 
+# ctypes handle for the C library – used to call connect() directly because
+# Python's socket.connect() for AF_BLUETOOTH/BTPROTO_L2CAP only accepts a
+# (bdaddr_str, psm) tuple and does NOT expose the l2_bdaddr_type field needed
+# to distinguish LE public/random addresses from classic BR/EDR.
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+
 def connect_coc(address: str, psm: int,
-                addr_type: int = _BDADDR_LE_PUBLIC) -> socket.socket:
-    """Connect to a BLE device via L2CAP Credit-Based CoC.
+                addr_type: int = _BDADDR_BREDR,
+                connect_timeout: float = 15.0) -> socket.socket:
+    """Connect to a robot via L2CAP (BR/EDR or BLE Credit-Based CoC).
 
     Returns a connected SOCK_SEQPACKET socket.  Each send()/recv() call
-    corresponds to exactly one L2CAP CoC SDU.
+    corresponds to exactly one L2CAP SDU.
 
-    Note: requires BlueZ ≥ 5.49 and CAP_NET_RAW (run as root or set
-    the capability on python3: sudo setcap cap_net_raw+eip $(which python3)).
+    addr_type: _BDADDR_BREDR (0) for classic BT, _BDADDR_LE_PUBLIC (1) or
+               _BDADDR_LE_RANDOM (2) for BLE.
+
+    Note: requires CAP_NET_RAW (run as root or
+    sudo setcap cap_net_raw+eip $(which python3.13)).
     """
-    sock = socket.socket(_AF_BLUETOOTH, socket.SOCK_SEQPACKET, _BTPROTO_L2CAP)
-    # Opt in to LE (required on some BlueZ versions for BLE CoC)
-    try:
-        BT_CHANNEL_POLICY    = 10
-        BLC_POLICY_SINGLE_LINK = 0
-        sock.setsockopt(274, BT_CHANNEL_POLICY, BLC_POLICY_SINGLE_LINK)
-    except OSError:
-        pass  # Older kernel – continue anyway
+    # BR/EDR connection-oriented L2CAP requires SOCK_STREAM in modern kernels.
+    # SOCK_SEQPACKET is reserved for LE CoC (credit-based) channels; using it
+    # with BDADDR_BREDR causes the kernel to return SO_ERROR=ENOSYS after the
+    # async connect resolves.
+    if addr_type == _BDADDR_BREDR:
+        sock_type = socket.SOCK_STREAM
+    else:
+        sock_type = socket.SOCK_SEQPACKET
+    sock = socket.socket(_AF_BLUETOOTH, sock_type, _BTPROTO_L2CAP)
 
     bd = _parse_addr(address)
     sa = struct.pack(_SOCKADDR_L2_FMT,
                      _AF_BLUETOOTH, psm, bd, 0, addr_type)
-    sock.connect(sa)
+
+    # Python's socket.connect() for BTPROTO_L2CAP rejects raw bytes and
+    # silently zero-fills l2_bdaddr_type (forcing BDADDR_BREDR=0).  Call the
+    # C-library connect() directly so the kernel sees the full sockaddr_l2
+    # including the LE address-type byte we packed above.
+    #
+    # SO_SNDTIMEO has no effect on BT socket connect()s in BlueZ.  Instead,
+    # make the socket non-blocking so connect() returns EINPROGRESS
+    # immediately, then use select() to enforce the timeout cleanly.
+    sock.setblocking(False)
+    addr_label = {_BDADDR_BREDR: "bredr",
+                  _BDADDR_LE_PUBLIC: "le-public",
+                  _BDADDR_LE_RANDOM: "le-random"}.get(addr_type, str(addr_type))
+    print(f"  [BLE] connecting → {address} PSM=0x{psm:04x} "
+          f"addr_type={addr_label}  timeout={connect_timeout:.0f}s")
+
+    ret = _libc.connect(sock.fileno(),
+                        ctypes.c_char_p(sa),
+                        ctypes.c_int(len(sa)))
+    if ret != 0:
+        err = ctypes.get_errno()
+        if err not in (errno.EINPROGRESS, errno.EWOULDBLOCK):
+            sock.close()
+            raise OSError(err, os.strerror(err))
+        # Poll until the connection completes or the deadline expires
+        _, writable, _ = select.select([], [sock], [], connect_timeout)
+        if not writable:
+            sock.close()
+            raise OSError(errno.ETIMEDOUT,
+                          f"No response from {address} within "
+                          f"{connect_timeout:.0f}s (device not advertising?)")
+        conn_err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if conn_err:
+            sock.close()
+            raise OSError(conn_err, os.strerror(conn_err))
+
+    sock.setblocking(True)
+    print("  [BLE] L2CAP CoC channel open.")
     return sock
 
 
@@ -399,10 +454,12 @@ def iap2_handshake(sock: socket.socket,
     def _recv_until(stop_len: int, max_packets: int = 30) -> bytes | None:
         """Drain packets until one of length stop_len is received."""
         for _ in range(max_packets):
+            readable, _, _ = select.select([sock], [], [], 3.0)
+            if not readable:
+                return None  # timeout
             try:
-                sock.settimeout(3.0)
                 pkt = sock.recv(512)
-            except TimeoutError:
+            except OSError:
                 return None
             if verbose:
                 print(f"  RX                      ({len(pkt):3d}B)  {pkt[:16].hex(' ')}")
@@ -449,15 +506,17 @@ def iap2_handshake(sock: socket.socket,
     p[19] = tok_b
     # Drain robot cert chain (expect ~6×131B + 1×14B)
     for _ in range(10):
+        readable, _, _ = select.select([sock], [], [], 3.0)
+        if not readable:
+            break
         try:
-            sock.settimeout(3.0)
             raw = sock.recv(512)
-            if verbose:
-                print(f"  RX (cert drain)         ({len(raw):3d}B)  {raw[:8].hex(' ')}")
-            # 14B robot ack of first 30B tick is also in this window
-            if len(raw) == 14 and raw[2] == 0x13:
-                break
-        except TimeoutError:
+        except OSError:
+            break
+        if verbose:
+            print(f"  RX (cert drain)         ({len(raw):3d}B)  {raw[:8].hex(' ')}")
+        # 14B robot ack of first 30B tick is also in this window
+        if len(raw) == 14 and raw[2] == 0x13:
             break
     # Drain 30B tick sent by robot before cert auth (record [297])
     # then send ef21 challenge
@@ -505,6 +564,10 @@ def iap2_handshake(sock: socket.socket,
     # Robot sends a 44B ef51 at startup, then a 13B heartbeat
     _recv_until(13, max_packets=20)
 
+    # Ensure the socket is back in fully blocking mode (no timeout) before
+    # handing it back to the caller.  The select()-based helpers above never
+    # mutate the socket state, but be explicit here as a defensive reset.
+    sock.setblocking(True)
     return tok_a, tok_b, tok_c
 
 
@@ -584,27 +647,34 @@ class RobotController:
 
     HEARTBEAT_INTERVAL = 0.25   # seconds between keep-alive packets
     COMMAND_REPEAT_INTERVAL = 0.05  # seconds between repeated movement frames
+    ACK_TIMEOUT = 3.0             # seconds to wait for a 7-byte ACK
 
     def __init__(self, address: str = ROBOT_ADDRESS, psm: int = DEFAULT_PSM,
-                 addr_type: int = _BDADDR_LE_PUBLIC,
+                 addr_type: int = _BDADDR_BREDR,
                  tok_a: int = 0x13, tok_b: int = 0x65, tok_c: int = 0x03,
-                 do_handshake: bool = True):
-        self.address      = address
-        self.psm          = psm
-        self.addr_type    = addr_type
-        self._tok_a       = tok_a
-        self._tok_b       = tok_b
-        self._tok_c       = tok_c
+                 do_handshake: bool = True,
+                 verbose: bool = False):
+        self.address       = address
+        self.psm           = psm
+        self.addr_type     = addr_type
+        self._tok_a        = tok_a
+        self._tok_b        = tok_b
+        self._tok_c        = tok_c
         self._do_handshake = do_handshake
-        self._builder  = RobotPacketBuilder(tok_a=tok_a, tok_b=tok_b, tok_c=tok_c)
+        self.verbose       = verbose
+        self._builder   = RobotPacketBuilder(tok_a=tok_a, tok_b=tok_b, tok_c=tok_c)
         self._sock: socket.socket | None = None
         self._hb_thread: threading.Thread | None = None
-        self._hb_stop   = threading.Event()
+        self._rx_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()       # shared stop for both threads
+        # Last ACK event: set whenever a 7-byte ACK arrives from the robot
+        self._ack_event  = threading.Event()
+        self._last_ack:  bytes | None = None
 
     # ── connection lifecycle ─────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Connect to the robot and start the heartbeat thread.
+        """Connect to the robot and start the heartbeat and reader threads.
 
         If do_handshake=True (the default) the iAP2 session setup sequence is
         run automatically after the L2CAP CoC channel is established.  Set
@@ -618,18 +688,32 @@ class RobotController:
             print("Running iAP2 handshake …")
             iap2_handshake(self._sock,
                            tok_a=self._tok_a, tok_b=self._tok_b, tok_c=self._tok_c,
-                           verbose=True)
+                           verbose=self.verbose)
             print("iAP2 handshake complete.")
-        self._hb_stop.clear()
+        self._stop_event.clear()
+        self._ack_event.clear()
         self._hb_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True)
+            target=self._heartbeat_loop, daemon=True, name="hb")
+        self._rx_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="rx")
         self._hb_thread.start()
+        self._rx_thread.start()
+        # Send one heartbeat and wait for the robot's first ACK before
+        # returning — confirms the session is live and the rx path works.
+        self._send(self._builder.heartbeat())
+        if self._ack_event.wait(timeout=self.ACK_TIMEOUT):
+            print(f"  [ACK] session confirmed  last_ack={self._last_ack.hex(' ')}")
+        else:
+            print("  [ACK] WARNING — no 7-byte ACK received within "
+                  f"{self.ACK_TIMEOUT:.0f}s; robot may not be responding")
 
     def disconnect(self) -> None:
-        """Stop heartbeat and close the connection."""
-        self._hb_stop.set()
+        """Stop heartbeat/reader threads and close the connection."""
+        self._stop_event.set()
         if self._hb_thread:
             self._hb_thread.join(timeout=2.0)
+        if self._rx_thread:
+            self._rx_thread.join(timeout=2.0)
         if self._sock:
             try:
                 self._sock.close()
@@ -653,12 +737,57 @@ class RobotController:
         self._sock.send(pkt)
 
     def _heartbeat_loop(self) -> None:
-        while not self._hb_stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self._send(self._builder.heartbeat())
             except OSError:
                 break
-            self._hb_stop.wait(self.HEARTBEAT_INTERVAL)
+            self._stop_event.wait(self.HEARTBEAT_INTERVAL)
+
+    def _reader_loop(self) -> None:
+        """Drain all robot→host frames, log them, and signal ACK events.
+
+        Runs in a background thread.  Uses select() to poll so the socket's
+        blocking mode (and send() behaviour in the main thread) is unaffected.
+        Every 7-byte frame whose byte[0]==tok_a and byte[1]==0x05 is an ACK.
+        """
+        sock = self._sock
+        if sock is None:
+            return
+        while not self._stop_event.is_set():
+            # Poll for readability without touching the socket's timeout/blocking mode
+            try:
+                readable, _, _ = select.select([sock], [], [], 0.5)
+            except OSError:
+                break
+            if not readable:
+                continue
+            try:
+                frame = sock.recv(512)
+            except OSError:
+                break
+            if not frame:
+                break
+            # 7-byte ACK: byte 0 == host tok_a, byte 1 == 0x05
+            is_ack = (len(frame) == 7
+                      and frame[0] == self._tok_a
+                      and frame[1] == 0x05)
+            if is_ack:
+                self._last_ack = frame
+                self._ack_event.set()
+                self._ack_event.clear()   # auto-reset for next wait()
+            if self.verbose:
+                tag = "ACK" if is_ack else f"{len(frame)}B"
+                print(f"  [RX {tag:>5}]  {frame.hex(' ')}", flush=True)
+
+    def wait_for_ack(self, timeout: float | None = None) -> bool:
+        """Block until the robot sends a 7-byte ACK, then return True.
+
+        Returns False if the timeout (default: ACK_TIMEOUT) expires first.
+        Useful after a one-shot command to confirm the robot received it.
+        """
+        return self._ack_event.wait(
+            timeout=timeout if timeout is not None else self.ACK_TIMEOUT)
 
     # ── commands ─────────────────────────────────────────────────────────────
 
@@ -724,27 +853,26 @@ class RobotController:
     def stop(self) -> None:
         """Send a neutral / stop packet."""
         self._send(self._builder.stop())
+        if self.verbose:
+            print("  [CMD] stop sent")
 
     def park(self) -> None:
         """Send the park/unpark toggle command."""
         self._send(self._builder.park())
-        print("Park command sent (toggles park state each call).")
+        acked = self.wait_for_ack()
+        print(f"  [CMD] park {'ACK ✓' if acked else 'NO ACK ✕'}")
 
     def raise_arm(self) -> None:
-        """Send the arm-raise toggle command.
-
-        The same 44-byte toggle packet as park().  Call once to start raising;
-        call again (or call lower_arm()) to stop / lower.
-        """
+        """Send the arm-raise toggle command."""
         self._send(self._builder.raise_arm())
+        acked = self.wait_for_ack()
+        print(f"  [CMD] raise_arm {'ACK ✓' if acked else 'NO ACK ✕'}")
 
     def lower_arm(self) -> None:
-        """Send the arm-lower toggle command.
-
-        Identical to raise_arm() at the packet level — the robot state
-        determines whether this raises or lowers the arm.
-        """
+        """Send the arm-lower toggle command."""
         self._send(self._builder.lower_arm())
+        acked = self.wait_for_ack()
+        print(f"  [CMD] lower_arm {'ACK ✓' if acked else 'NO ACK ✕'}")
 
     def custom_move(self, m1: int, m2: int,
                     duration: float = 0.0) -> None:
@@ -868,29 +996,25 @@ def verify_packets() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run_demo(ctrl: RobotController) -> None:
-    """Simple interactive demo: drive a square path then park."""
-    print("Demo: forward → left → left → left → left → park")
-    ctrl.forward(duration=1.0)
-    time.sleep(0.2)
-    ctrl.turn_left(duration=0.6)
-    time.sleep(0.2)
-    ctrl.forward(duration=1.0)
-    time.sleep(0.2)
-    ctrl.turn_left(duration=0.6)
-    time.sleep(0.2)
-    ctrl.forward(duration=1.0)
-    time.sleep(0.2)
-    ctrl.turn_left(duration=0.6)
-    time.sleep(0.2)
-    ctrl.forward(duration=1.0)
-    time.sleep(0.2)
-    ctrl.turn_left(duration=0.6)
-    time.sleep(0.2)
-    ctrl.stop()
-    time.sleep(0.5)
-    ctrl.park()
-    time.sleep(0.5)
-    ctrl.park()  # unpark
+    """Simple demo: forward, turn, park/unpark toggle."""
+    steps = [
+        ("forward 1.0s",   lambda: ctrl.forward(duration=1.0)),
+        ("turn_left 0.6s", lambda: ctrl.turn_left(duration=0.6)),
+        ("forward 1.0s",   lambda: ctrl.forward(duration=1.0)),
+        ("turn_left 0.6s", lambda: ctrl.turn_left(duration=0.6)),
+        ("forward 1.0s",   lambda: ctrl.forward(duration=1.0)),
+        ("turn_left 0.6s", lambda: ctrl.turn_left(duration=0.6)),
+        ("forward 1.0s",   lambda: ctrl.forward(duration=1.0)),
+        ("turn_left 0.6s", lambda: ctrl.turn_left(duration=0.6)),
+        ("stop",           lambda: ctrl.stop()),
+        ("park",           lambda: ctrl.park()),
+        ("park (unpark)",  lambda: ctrl.park()),
+    ]
+    print(f"Demo: {len(steps)} steps")
+    for label, fn in steps:
+        print(f"  >> {label}")
+        fn()
+        time.sleep(0.2)
 
 
 def _interactive(ctrl: RobotController) -> None:
@@ -928,9 +1052,10 @@ def main() -> None:
                         help="Robot BLE MAC address (default: %(default)s)")
     parser.add_argument("--psm", default=f"0x{DEFAULT_PSM:04x}",
                         help="L2CAP CoC PSM (default: %(default)s)")
-    parser.add_argument("--addr-type", default="public",
-                        choices=["public", "random"],
-                        help="BLE address type (default: %(default)s)")
+    parser.add_argument("--addr-type", default="bredr",
+                        choices=["public", "random", "bredr"],
+                        help="Address type: bredr (classic), public (BLE), random (BLE) "
+                             "(default: %(default)s)")
     parser.add_argument("--scan", action="store_true",
                         help="Scan for nearby BLE devices and exit")
     parser.add_argument("--discover-psm", action="store_true",
@@ -941,6 +1066,8 @@ def main() -> None:
                         help="Run the built-in square-path demo")
     parser.add_argument("--interactive", action="store_true",
                         help="Launch WASD interactive keyboard control")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print every RX frame from the robot")
     args = parser.parse_args()
 
     if args.self_test:
@@ -952,15 +1079,17 @@ def main() -> None:
         return
 
     psm = int(args.psm, 0)
-    addr_type = (_BDADDR_LE_PUBLIC if args.addr_type == "public"
-                 else _BDADDR_LE_RANDOM)
+    addr_type = {"public": _BDADDR_LE_PUBLIC,
+                 "random": _BDADDR_LE_RANDOM,
+                 "bredr":  _BDADDR_BREDR}[args.addr_type]
 
     if args.discover_psm:
         asyncio.run(discover_psm(args.address))
         return
 
     try:
-        with RobotController(args.address, psm, addr_type) as ctrl:
+        with RobotController(args.address, psm, addr_type,
+                             verbose=args.verbose) as ctrl:
             if args.demo:
                 _run_demo(ctrl)
             elif args.interactive:
